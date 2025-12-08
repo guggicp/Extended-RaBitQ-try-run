@@ -5,7 +5,6 @@ project(ExRaBitQ LANGUAGES CXX)
 set(CXX_STANDARD 17)
 
 include_directories(${PROJECT_SOURCE_DIR}/inc)
-
 # AVX512 required
 include(CheckCXXSourceCompiles)
 set(AVX2_CXX_CODE "#include <immintrin.h>

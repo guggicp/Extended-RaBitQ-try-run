@@ -38,6 +38,7 @@ bin/
 # vscode
 .vscode/
 .clang-format
+.cache/
 
 # Eigen
 Eigen/
