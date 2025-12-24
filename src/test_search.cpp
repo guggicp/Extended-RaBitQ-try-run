@@ -7,8 +7,10 @@
 #include <string>
 #include <cmath>
 #include <iomanip>
-#include <sys/resource.h>
 #include <algorithm>
+#include <cstring>
+#include <sys/resource.h>
+#include <cassert>
 
 #include "defines.hpp"
 #include "index/IVF.hpp"
@@ -24,236 +26,239 @@ size_t get_memory_usage_mb() {
     return 0;
 }
 
-// --- 2. 智能参数生成器 (适配 IVF) ---
+// --- 2. 健壮的文件读取函数 ---
+
+void load_fbin(const std::string& path, FloatRowMat& mat) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) { std::cerr << "Open failed: " << path << std::endl; exit(1); }
+    uint32_t n, d;
+    in.read((char*)&n, 4); in.read((char*)&d, 4);
+    mat.resize(n, d);
+    in.read((char*)mat.data(), n * d * sizeof(float));
+    std::cout << "[IO] Loaded .fbin: " << path << " (" << n << "x" << d << ")\n";
+}
+
+void load_i8bin(const std::string& path, FloatRowMat& mat) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) { std::cerr << "Open failed: " << path << std::endl; exit(1); }
+    uint32_t n, d;
+    in.read((char*)&n, 4); in.read((char*)&d, 4);
+    mat.resize(n, d);
+    std::vector<int8_t> buf(n * d);
+    in.read((char*)buf.data(), n * d * sizeof(int8_t));
+    #pragma omp parallel for
+    for(size_t i=0; i<n*d; ++i) mat.data()[i] = static_cast<float>(buf[i]);
+    std::cout << "[IO] Loaded .i8bin: " << path << " (" << n << "x" << d << ")\n";
+}
+
+void load_fvecs(const std::string& path, FloatRowMat& mat) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) { std::cerr << "Open failed: " << path << std::endl; exit(1); }
+    in.seekg(0, std::ios::end);
+    size_t fsize = in.tellg();
+    in.seekg(0, std::ios::beg);
+    int32_t d; in.read((char*)&d, 4);
+    size_t row_size = 4 + d * 4;
+    size_t n = fsize / row_size;
+    mat.resize(n, d);
+    in.seekg(0, std::ios::beg);
+    for(size_t i=0; i<n; ++i) {
+        int32_t dd; in.read((char*)&dd, 4);
+        in.read((char*)&mat(i, 0), d * sizeof(float));
+    }
+    std::cout << "[IO] Loaded .fvecs: " << path << " (" << n << "x" << d << ")\n";
+}
+
+void load_ivecs(const std::string& path, UintRowMat& mat) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) { std::cerr << "Open failed: " << path << std::endl; exit(1); }
+    in.seekg(0, std::ios::end);
+    size_t fsize = in.tellg();
+    in.seekg(0, std::ios::beg);
+    int32_t d; in.read((char*)&d, 4);
+    size_t row_size = 4 + d * 4;
+    size_t n = fsize / row_size;
+    mat.resize(n, d);
+    in.seekg(0, std::ios::beg);
+    for(size_t i=0; i<n; ++i) {
+        int32_t dd; in.read((char*)&dd, 4);
+        if(dd != d) { std::cerr << "ivecs dim mismatch\n"; exit(1); }
+        std::vector<int32_t> buf(d);
+        in.read((char*)buf.data(), d * sizeof(int32_t));
+        for(size_t j=0; j<(size_t)d; ++j) mat(i, j) = static_cast<PID>(buf[j]);
+    }
+    std::cout << "[IO] Loaded .ivecs: " << path << " (" << n << "x" << d << ")\n";
+}
+
+void load_ibin(const std::string& path, UintRowMat& mat) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) { std::cerr << "Open failed: " << path << std::endl; exit(1); }
+    uint32_t n, d;
+    in.read((char*)&n, 4); in.read((char*)&d, 4);
+    mat.resize(n, d);
+    std::vector<int32_t> buf(n * d);
+    in.read((char*)buf.data(), n * d * sizeof(int32_t));
+    for(size_t i=0; i<n*d; ++i) mat.data()[i] = static_cast<PID>(buf[i]);
+    std::cout << "[IO] Loaded .ibin: " << path << " (" << n << "x" << d << ")\n";
+}
+
+void load_data_auto(const std::string& path, FloatRowMat& mat) {
+    if (path.find(".fbin") != std::string::npos) load_fbin(path, mat);
+    else if (path.find(".i8bin") != std::string::npos) load_i8bin(path, mat);
+    else if (path.find(".fvecs") != std::string::npos) load_fvecs(path, mat);
+    else load_fbin(path, mat); // Default
+}
+
+// 修复后的 GT 加载逻辑：接受 expected_nq 参数
+void load_gt_auto(const std::string& path, UintRowMat& mat, size_t expected_nq) {
+    // 1. 优先后缀判断
+    if (path.find(".ibin") != std::string::npos) { load_ibin(path, mat); return; }
+    if (path.find(".ivecs") != std::string::npos) { load_ivecs(path, mat); return; }
+
+    // 2. 读取 Header 进行智能探测
+    std::ifstream in(path, std::ios::binary);
+    if (!in) { std::cerr << "Open failed: " << path << std::endl; exit(1); }
+    int32_t val1, val2;
+    in.read((char*)&val1, 4);
+    in.read((char*)&val2, 4);
+    in.close();
+
+    // 核心修复：如果文件头的 N 等于查询数量，且 D 比较小，那就是 .ibin
+    // word2vec: N=1000, K=1/10/100.
+    // val1=1000 (match expected_nq), val2=1. -> .ibin
+    if (val1 == (int32_t)expected_nq && val2 <= 2000) {
+        std::cout << "[IO] Header (" << val1 << "," << val2 << ") matches Query Count -> .ibin\n";
+        load_ibin(path, mat);
+    } 
+    // 旧的 heuristic: N > 2000 (对于 word2vec 失败)
+    else if (val1 > 2000 && val2 <= 2000) {
+        std::cout << "[IO] Header (" << val1 << "," << val2 << ") looks like large .ibin\n";
+        load_ibin(path, mat);
+    } 
+    else {
+        std::cout << "[IO] Header (" << val1 << "," << val2 << ") -> assuming .ivecs\n";
+        load_ivecs(path, mat);
+    }
+}
+
+// --- 3. 智能参数生成器 ---
 class BeamSizeGenerator {
 private:
-    int e;
-    size_t index;
-    // 针对 IVF，nprobe 需要从很小的值开始 (1, 2, 3...)
-    const std::vector<int> bases; 
-    int k; // topk
-
+    int e; size_t index; const std::vector<int> bases; int k;
 public:
-    BeamSizeGenerator(int k) 
-        // 扩展 bases 以覆盖小的 nprobe
-        : bases({1, 2, 3, 4, 5, 6, 8, 10, 15, 20, 25, 30, 40, 50, 60, 70, 80}), k(k) {
-        // 强制从 e=0 (即 10^0=1) 开始，保证覆盖 nprobe=1,2,3
-        e = 0; 
-        index = 0;
-    }
-
+    BeamSizeGenerator(int k) : bases({1, 2, 3, 4, 5, 6, 8, 10, 15, 20, 25, 30, 40, 50, 60, 70, 80}), k(k) { e = 0; index = 0; }
     int next() {
         int val = bases[index] * static_cast<int>(pow(10.0, static_cast<double>(e)));
         index++;
-        if (index >= bases.size()) {
-            e++;
-            index = 0;
-        }
+        if (index >= bases.size()) { e++; index = 0; }
         return val;
     }
 };
 
-// --- 3. 数据读取 (支持 .i8bin/.fbin/.fvecs) ---
-void load_float_mat_generic(const std::string& path, FloatRowMat& mat) {
-    if (path.find(".fbin") != std::string::npos) {
-        std::ifstream in(path, std::ios::binary);
-        if(!in) { std::cerr << "Open failed: " << path << std::endl; exit(1); }
-        uint32_t n, d; in.read((char*)&n, 4); in.read((char*)&d, 4);
-        mat.resize(n, d);
-        in.read((char*)mat.data(), n * d * sizeof(float));
-    } else if (path.find(".i8bin") != std::string::npos) {
-        std::ifstream in(path, std::ios::binary);
-        if(!in) { std::cerr << "Open failed: " << path << std::endl; exit(1); }
-        uint32_t n, d; in.read((char*)&n, 4); in.read((char*)&d, 4);
-        mat.resize(n, d);
-        std::vector<int8_t> buf(n * d);
-        in.read((char*)buf.data(), n * d * sizeof(int8_t));
-        #pragma omp parallel for
-        for(size_t i=0; i<n*d; ++i) mat.data()[i] = static_cast<float>(buf[i]);
-    } else {
-        load_vecs<float, FloatRowMat>(path.c_str(), mat);
-    }
-}
-
-void load_uint_mat_generic(const std::string& path, UintRowMat& mat) {
-    if (path.find(".ibin") != std::string::npos) {
-        std::ifstream in(path, std::ios::binary);
-        if(!in) { std::cerr << "Open failed: " << path << std::endl; exit(1); }
-        uint32_t n, d; in.read((char*)&n, 4); in.read((char*)&d, 4);
-        mat.resize(n, d);
-        std::vector<int32_t> buf(n * d);
-        in.read((char*)buf.data(), n * d * sizeof(int32_t));
-        for(size_t i=0; i<n*d; ++i) mat.data()[i] = (PID)buf[i];
-    } else {
-        load_vecs<PID, UintRowMat>(path.c_str(), mat);
-    }
-}
-
-// --- 4. 自动寻找最佳 nprobes (复刻 find_EFS 逻辑) ---
-std::vector<int> find_nprobes(
-    IVF& ivf, 
-    const FloatRowMat& rotated_query, 
-    const FloatRowMat& data, 
-    const std::vector<std::unordered_set<PID>>& gt_sets,
-    int topk, 
-    const std::string& distance
-) {
-    std::vector<int> selected_nprobes;
+// --- 4. 自动寻找最佳 nprobes ---
+std::vector<int> find_nprobes(IVF& ivf, const FloatRowMat& rotated_query, const FloatRowMat& data, 
+                              const std::vector<std::unordered_set<PID>>& gt_sets, int topk, const std::string& distance) {
+    std::vector<int> selected;
     BeamSizeGenerator W(topk);
     float prev_recall = 0.0f;
     size_t NQ = rotated_query.rows();
-    size_t total_num = NQ * topk;
-    size_t max_nprobe = ivf.k(); // IVF 的聚类中心数
-
-    std::cout << "[Info] Finding optimal nprobes for distance=" << distance << ", topk=" << topk << " ...\n";
-    std::cout << "[Info] Candidates: ";
-
+    size_t max_nprobe = ivf.k();
+    
+    std::cout << "[Info] Finding nprobes for topk=" << topk << "...\n[Info] Candidates: ";
     std::unordered_set<int> visited;
 
     while (true) {
         int nprobe = W.next();
-
-        // 边界保护：不能超过总聚类数
         if (nprobe > max_nprobe) {
-            if (visited.find(max_nprobe) == visited.end()) nprobe = max_nprobe;
-            else break;
+            if (visited.find(max_nprobe) == visited.end()) nprobe = max_nprobe; else break;
         }
         if (visited.count(nprobe)) continue;
         visited.insert(nprobe);
 
-        // 快速跑一次获取 Recall
-        size_t total_correct = 0;
+        size_t correct = 0;
         StopW stopw;
         std::vector<PID> results(topk);
-        
         for (size_t i = 0; i < NQ; ++i) {
             ivf.search(&rotated_query(i, 0), data.data(), topk, nprobe, results.data());
-            for (PID id : results) {
-                if (gt_sets[i].count(id)) total_correct++;
-            }
+            for (PID id : results) if (gt_sets[i].count(id)) correct++;
         }
-        float time_us = stopw.getElapsedTimeMicro();
-        float recall = static_cast<float>(total_correct) / total_num;
-        float qps = NQ / (time_us / 1e6);
+        float recall = (float)correct / (NQ * topk);
+        float qps = NQ / (stopw.getElapsedTimeMicro() / 1e6);
+        std::cout << nprobe << " "; std::cout.flush();
+        selected.push_back(nprobe);
 
-        std::cout << nprobe << " ";
-        std::cout.flush();
-        
-        selected_nprobes.push_back(nprobe);
-
-        // 停止条件：Recall 极高 或 提升停滞 或 速度太慢
-        if (recall > 0.998f || (recall - prev_recall) < 0.0005f || qps < 10.0f || nprobe == max_nprobe) {
-            break;
-        }
+        if (recall > 0.998f || (recall - prev_recall) < 0.0005f || qps < 10.0f || nprobe == max_nprobe) break;
         prev_recall = recall;
     }
-    std::cout << "\n[Info] Selection done. Found " << selected_nprobes.size() << " probes.\n";
-    return selected_nprobes;
+    std::cout << "\n";
+    return selected;
 }
 
-// --- 5. 主函数 ---
+// --- 5. Main ---
 int main(int argc, char* argv[]) {
-    // 兼容 shell 脚本的参数位置：
-    // argv: [0]exe [1]"search" [2]Deg(K) [3]Dist [4]Index [5]Data [6]Query [7]GT [8]k [9]Rounds
-    if (argc < 10) {
-        std::cerr << "Usage: " << argv[0] << " search <deg> <dist> <index> <data> <query> <gt> <k> [rounds]\n";
-        return 1;
-    }
-
-    std::string distance_str = argv[3];
-    std::string index_file = argv[4];
-    std::string data_file = argv[5];
-    std::string query_file = argv[6];
-    std::string gt_file = argv[7];
-    size_t TOPK = std::stoul(argv[8]);
-    size_t ROUND = std::stoul(argv[9]);
-
-    // 加载数据
-    FloatRowMat data;
-    FloatRowMat query;
+    if (argc < 10) { std::cerr << "Usage error\n"; return 1; }
+    std::string dist = argv[3], idx_file = argv[4], data_file = argv[5], q_file = argv[6], gt_file = argv[7];
+    size_t TOPK = std::stoul(argv[8]), ROUND = std::stoul(argv[9]);
+    int B = std::stoi(argv[2]);
+    assert(B == 9 || B == 5 || B == 7 || B == 3 || B == 4 || B == 8);
+    FloatRowMat data, query;
     UintRowMat gt_mat;
-    load_float_mat_generic(data_file, data);
-    load_float_mat_generic(query_file, query);
-    load_uint_mat_generic(gt_file, gt_mat);
 
-    size_t N = data.rows();
-    size_t DIM = data.cols();
+    std::cout << "--- Loading ---\n";
+    load_data_auto(data_file, data);
+    load_data_auto(q_file, query);
+    
+    // 关键修正：先获取 Query 数量，再加载 GT
     size_t NQ = query.rows();
-    std::cout << "Data loaded: N=" << N << ", DIM=" << DIM << ", NQ=" << NQ << "\n";
+    std::cout << "NQ detected: " << NQ << ". Loading GT...\n";
+    load_gt_auto(gt_file, gt_mat, NQ); 
 
-    // 转换 GT 为 Set 加速比对
+    // 校验 GT 维度
+    if (gt_mat.rows() != NQ) {
+        std::cerr << "Error: GT rows (" << gt_mat.rows() << ") != Query rows (" << NQ << ")\n";
+        exit(1);
+    }
+
+    size_t N = data.rows(), DIM = data.cols();
+    std::cout << "Data: " << N << "x" << DIM << "\n";
+
     std::vector<std::unordered_set<PID>> gt_sets(NQ);
-    for(size_t i=0; i<NQ; ++i) {
+    for(size_t i=0; i<NQ; ++i) 
         for(size_t j=0; j<(size_t)gt_mat.cols(); ++j) gt_sets[i].insert(gt_mat(i, j));
-    }
 
-    // 加载索引
     size_t m1 = get_memory_usage_mb();
-    IVF ivf;
-    ivf.load(index_file.c_str());
+    IVF ivf; ivf.load(idx_file.c_str());
     size_t m2 = get_memory_usage_mb();
-    size_t memory_mb = m2 - m1;
 
-    // 预处理 Query (Rotation)
+    FloatRowMat p_q(NQ, ivf.padded_dim()), r_q(NQ, ivf.padded_dim());
+    p_q.setZero();
+    for(size_t i=0; i<NQ; ++i) std::memcpy(&p_q(i, 0), &query(i, 0), sizeof(float) * DIM);
+    
     StopW stopw;
-    FloatRowMat padded_query(NQ, ivf.padded_dim());
-    padded_query.setZero();
-    FloatRowMat rotated_query(NQ, ivf.padded_dim());
-    for(size_t i=0; i<NQ; ++i) {
-        std::memcpy(&padded_query(i, 0), &query(i, 0), sizeof(float) * DIM);
-    }
-    Rotator& rp = ivf.rotator();
-    stopw.reset();
-    rp.rotate(padded_query, rotated_query);
-    float rotate_time_us = stopw.getElapsedTimeMicro(); // 旋转总耗时
+    ivf.rotator().rotate(p_q, r_q);
+    float rot_time = stopw.getElapsedTimeMicro();
 
-    // 自动选择参数
-    std::vector<int> nprobes = find_nprobes(ivf, rotated_query, data, gt_sets, TOPK, distance_str);
+    std::vector<int> nprobes = find_nprobes(ivf, r_q, data, gt_sets, TOPK, dist);
 
-    // --- 正式测试 (Output CSV) ---
-    // 这是为了欺骗 plot 脚本，ExRaBitQ 的 "ef" 就是 "nprobe"
     std::cout << "ef,recall@" << TOPK << ",qps,mean_latency_ms,memory_usage_mb" << std::endl;
-
-    for (int nprobe : nprobes) {
-        double sum_recall = 0.0;
-        double sum_qps = 0.0;
-        double sum_lat = 0.0;
-
-        // 这里相当于原来的 horizontal_avg 逻辑：
-        // 跑 ROUND 次，累加结果，最后取平均
+    for (int np : nprobes) {
+        double s_rec = 0, s_qps = 0, s_lat = 0;
         for (size_t r = 0; r < ROUND; ++r) {
-            size_t total_correct = 0;
-            float search_time_us = 0;
-            std::vector<PID> results(TOPK);
-
+            size_t corr = 0;
+            float t_search = 0;
+            std::vector<PID> res(TOPK);
             for (size_t i = 0; i < NQ; ++i) {
                 stopw.reset();
-                ivf.search(&rotated_query(i, 0), data.data(), TOPK, nprobe, results.data());
-                search_time_us += stopw.getElapsedTimeMicro();
-
-                for (PID id : results) {
-                    if (gt_sets[i].count(id)) total_correct++;
-                }
+                ivf.search(&r_q(i, 0), data.data(), TOPK, np, res.data());
+                t_search += stopw.getElapsedTimeMicro();
+                for (PID id : res) if (gt_sets[i].count(id)) corr++;
             }
-
-            // 指标计算 (包含 Rotation 时间，公平对比)
-            float total_time_us = search_time_us + rotate_time_us;
-            float qps = NQ / (total_time_us / 1e6);
-            float recall = static_cast<float>(total_correct) / (NQ * TOPK);
-            float latency_ms = (total_time_us / NQ) / 1000.0f;
-
-            sum_recall += recall;
-            sum_qps += qps;
-            sum_lat += latency_ms;
+            float t_total = t_search + rot_time;
+            s_rec += (float)corr / (NQ * TOPK);
+            s_qps += NQ / (t_total / 1e6);
+            s_lat += (t_total / NQ) / 1000.0f;
         }
-
-        // 输出平均值
-        std::cout << nprobe << "," 
-                  << (sum_recall / ROUND) << "," 
-                  << (sum_qps / ROUND) << "," 
-                  << (sum_lat / ROUND) << "," 
-                  << memory_mb << std::endl;
+        std::cout << np << "," << s_rec/ROUND * 100.0F << "," << s_qps/ROUND << "," << s_lat/ROUND << "," << (m2-m1) << "\n";
     }
-
     return 0;
 }
