@@ -239,24 +239,40 @@ int main(int argc, char* argv[]) {
     float rot_time = stopw.getElapsedTimeMicro();
 
     std::vector<int> nprobes = find_nprobes(ivf, r_q, data, gt_sets, TOPK, dist);
-
+    
     std::cout << "ef,recall@" << TOPK << ",qps,mean_latency_ms,memory_usage_mb" << std::endl;
+
+    const char* env_threads = getenv("OMP_NUM_THREADS");
+    int num_t = env_threads ? atoi(env_threads) : 1;
+    omp_set_num_threads(num_t);
     for (int np : nprobes) {
         double s_rec = 0, s_qps = 0, s_lat = 0;
         for (size_t r = 0; r < ROUND; ++r) {
-            size_t corr = 0;
-            float t_search = 0;
-            std::vector<PID> res(TOPK);
-            for (size_t i = 0; i < NQ; ++i) {
-                stopw.reset();
-                ivf.search(&r_q(i, 0), data.data(), TOPK, np, res.data());
-                t_search += stopw.getElapsedTimeMicro();
-                for (PID id : res) if (gt_sets[i].count(id)) corr++;
+            size_t total_corr = 0;
+            stopw.reset(); // 开始全量计时
+            
+            #pragma omp parallel
+            {
+                std::vector<PID> local_res(TOPK); // 每个线程独立的 buffer
+                size_t local_corr = 0;
+                
+                #pragma omp for nowait // 并行分发查询
+                for (size_t i = 0; i < NQ; ++i) {
+                    ivf.search(&r_q(i, 0), data.data(), TOPK, np, local_res.data());
+                    for (PID id : local_res) {
+                        if (gt_sets[i].count(id)) local_corr++;
+                    }
+                }
+                
+                #pragma omp atomic
+                total_corr += local_corr;
             }
-            float t_total = t_search + rot_time;
-            s_rec += (float)corr / (NQ * TOPK);
-            s_qps += NQ / (t_total / 1e6);
-            s_lat += (t_total / NQ) / 1000.0f;
+            
+            float t_total_seconds = (stopw.getElapsedTimeMicro() + rot_time) / 1e6;
+            
+            s_rec += (float)total_corr / (NQ * TOPK);
+            s_qps += NQ / t_total_seconds;
+            s_lat += (t_total_seconds * 1000.0f) / NQ; // 这里的 Latency 会受并发影响变大
         }
         std::cout << np << "," << s_rec/ROUND * 100.0F << "," << s_qps/ROUND << "," << s_lat/ROUND << "," << (m2-m1) << "\n";
     }

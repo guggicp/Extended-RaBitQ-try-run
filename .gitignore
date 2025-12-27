@@ -51,3 +51,8 @@ data/*/
 
 # python
 *.pyc
+
+# logs
+*.log
+*log*/
+plots/
