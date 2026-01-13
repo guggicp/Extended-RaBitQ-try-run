@@ -162,8 +162,13 @@ std::vector<int> find_nprobes(IVF& ivf, const FloatRowMat& rotated_query, const 
     BeamSizeGenerator W(topk);
     float prev_recall = 0.0f;
     size_t NQ = rotated_query.rows();
-    size_t max_nprobe = ivf.k();
+    size_t max_nprobe = ivf.k();  // 如果 ivf.k() 太小（如=2），仍会受限
     
+    const int MIN_POINTS = 10; // ←←← 关键：至少跑 10 个点
+    const float MIN_GAIN = 0.0005f; // 0.05%
+    const float MAX_RECALL = 0.998f;
+    const float MIN_QPS = 10.0f;
+
     std::cout << "[Info] Finding nprobes for topk=" << topk << "...\n[Info] Candidates: ";
     std::unordered_set<int> visited;
 
@@ -187,7 +192,18 @@ std::vector<int> find_nprobes(IVF& ivf, const FloatRowMat& rotated_query, const 
         std::cout << nprobe << " "; std::cout.flush();
         selected.push_back(nprobe);
 
-        if (recall > 0.998f || (recall - prev_recall) < 0.0005f || qps < 10.0f || nprobe == max_nprobe) break;
+        bool should_break = false;
+        if (selected.size() >= MIN_POINTS) {
+            if (recall > MAX_RECALL || 
+                (recall - prev_recall) < MIN_GAIN || 
+                qps < MIN_QPS || 
+                nprobe == max_nprobe) {
+                should_break = true;
+            }
+        }
+
+        if (should_break) break;
+        // if (recall > 0.998f || (recall - prev_recall) < 0.0005f || qps < 10.0f || nprobe == max_nprobe) break;
         prev_recall = recall;
     }
     std::cout << "\n";
